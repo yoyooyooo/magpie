@@ -64,6 +64,12 @@ type unitRun struct {
 	// runOn is how many units in a row were cut at unitMost, with no break
 	// in them, as the same few words over and over (runOnWords)
 	runOn int
+	// bare is a run of symbol-only or whitespace-only output that carries
+	// no word: its bytes so far, how many of its lines repeated one
+	// symbol, and the symbol (a space when the run is only whitespace).
+	bareN     int
+	bareSeen  int
+	bareShape rune
 }
 
 type unitCount struct {
@@ -235,6 +241,9 @@ func (r *unitRun) add(s string) (loopTrip, bool) {
 	for _, c := range s {
 		switch {
 		case c == '\n':
+			if t, ok := r.bareTake(c); ok {
+				return t, true
+			}
 			if t, ok := r.end(); ok {
 				return t, true
 			}
@@ -246,6 +255,9 @@ func (r *unitRun) add(s string) (loopTrip, bool) {
 			continue
 		}
 		r.cur.WriteRune(c)
+		if t, ok := r.bareTake(c); ok {
+			return t, true
+		}
 		switch c {
 		case '.', '!', '?':
 			// a sentence's stop, not a list's number (1.) or a decimal
@@ -260,6 +272,9 @@ func (r *unitRun) add(s string) (loopTrip, bool) {
 			r.lettered = r.lettered || unicode.IsLetter(c)
 		}
 		if r.cur.Len() >= unitMost {
+			if t, ok := r.bareFlush(true); ok {
+				return t, true
+			}
 			// a unit this long has had no break: a loop with none in it
 			// ("mcp mcp mcp …", #1489) is never 256 of them before the
 			// reply's limit, so it is read on its own
@@ -282,6 +297,9 @@ func (r *unitRun) add(s string) (loopTrip, bool) {
 // end takes the unit written so far, and says whether the window has
 // become a loop with it.
 func (r *unitRun) end() (loopTrip, bool) {
+	if t, ok := r.bareFlush(false); ok {
+		return t, true
+	}
 	raw := r.cur.String()
 	if r.cur.Len() < unitMost {
 		// a break; a long unit before it that still runs on keeps the count
@@ -343,6 +361,144 @@ func (r *unitRun) end() (loopTrip, bool) {
 		t.units = append(t.units, c.text)
 	}
 	return t, true
+}
+
+// bareRun is how many bytes of one symbol, or of whitespace, with no
+// word in them, are a loop. A horizontal rule or a code fence is far
+// shorter than this.
+const bareRun = 512
+
+// bareRepeats is how many times one short symbol-only line ("* ", "---")
+// may come before it is a loop. Ordinary markdown uses a rule or a fence
+// a handful of times, not dozens.
+const bareRepeats = 48
+
+// bareNote says a symbol or whitespace loop was found, and names its
+// shape without quoting the whole run.
+func bareNote(shape string, n int) loopTrip {
+	quote := " "
+	if shape != "" && shape != " " {
+		quote = strings.Repeat(shape, 3)
+	}
+	return loopTrip{units: []string{quote}, window: n, runOn: true}
+}
+
+// bareTake counts one character of a possible symbol or whitespace run.
+// A letter, a digit or a second symbol clears it. bareRun bytes of one
+// symbol, or of whitespace, are a loop before the unit is cut.
+func (r *unitRun) bareTake(c rune) (loopTrip, bool) {
+	if c == '\n' || c == '\r' {
+		// a line break in a symbol run is not itself a symbol; a line
+		// break while nothing but whitespace is open continues that run,
+		// and the first one opens it
+		if r.bareShape != 0 && r.bareShape != ' ' {
+			return loopTrip{}, false
+		}
+		if r.cur.Len() == 0 {
+			r.bareShape = ' '
+			r.bareN++
+			if r.bareN >= bareRun {
+				return bareNote(" ", r.bareN), true
+			}
+		}
+		return loopTrip{}, false
+	}
+	if unicode.IsSpace(c) {
+		if r.bareShape == 0 {
+			r.bareShape = ' '
+		}
+		r.bareN++
+		if r.bareN >= bareRun {
+			return bareNote(string(r.bareShape), r.bareN), true
+		}
+		return loopTrip{}, false
+	}
+	if unicode.IsLetter(c) || unicode.IsDigit(c) || c == '_' || (r.bareShape != 0 && r.bareShape != ' ' && c != r.bareShape) {
+		r.bareClear()
+		return loopTrip{}, false
+	}
+	if r.bareShape == ' ' {
+		// symbols after whitespace belong to the same low-information run
+		r.bareShape = c
+	} else if r.bareShape == 0 {
+		r.bareShape = c
+	}
+	r.bareN++
+	if r.bareN >= bareRun {
+		return bareNote(string(r.bareShape), r.bareN), true
+	}
+	return loopTrip{}, false
+}
+
+// bareFlush closes the unit being written. A line of one symbol counts
+// toward bareRepeats; a word or a mix of symbols clears the run. cut is a
+// unit taken at unitMost, which has no line of its own yet.
+func (r *unitRun) bareFlush(cut bool) (loopTrip, bool) {
+	raw := r.cur.String()
+	shape, ws := bareShape(raw)
+	// an empty unit is the break between blank lines; it does not clear a
+	// whitespace run already counted in bareTake
+	if raw == "" {
+		return loopTrip{}, false
+	}
+	if shape == "" {
+		r.bareClear()
+		return loopTrip{}, false
+	}
+	if cut {
+		if r.bareN >= bareRun {
+			return bareNote(shape, r.bareN), true
+		}
+		return loopTrip{}, false
+	}
+	if !ws {
+		r.bareSeen++
+		if r.bareSeen >= bareRepeats {
+			r.cur.Reset()
+			r.stop, r.lettered = false, false
+			return bareNote(shape, r.bareN), true
+		}
+	}
+	return loopTrip{}, false
+}
+
+func (r *unitRun) bareClear() {
+	r.bareN, r.bareSeen, r.bareShape = 0, 0, 0
+}
+
+// bareShape is raw's one repeated symbol, or a space when raw is only
+// whitespace. A word, a digit or two different symbols ("| --- | --- |")
+// are not a bare run.
+func bareShape(raw string) (shape string, ws bool) {
+	if raw == "" {
+		return "", false
+	}
+	if strings.Trim(raw, " \t\r\n") == "" {
+		return " ", true
+	}
+	if _, ok := unitKey(raw); ok {
+		return "", false
+	}
+	var sym rune
+	for _, c := range raw {
+		if unicode.IsSpace(c) {
+			continue
+		}
+		if unicode.IsLetter(c) || unicode.IsDigit(c) || c == '_' {
+			return "", false
+		}
+		if sym == 0 {
+			sym = c
+			continue
+		}
+		if c != sym {
+			return "", false
+		}
+	}
+	if sym == 0 {
+		return "", false
+	}
+	return string(sym), false
 }
 
 // runOnUnits is how many units cut at unitMost in a row, each the same
